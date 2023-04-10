@@ -21,15 +21,15 @@ print("Meta data acquired...")
 ```
 
 
-# Import the peaks into a merged list object and plot for number of peaks at each timepoint
+# Import the peaks into a merged list object
 ```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
 library(ChIPpeakAnno)
 
-# Import the cons peaks
+# Import the peaks
 peakList <- sapply(file.path(dir_bed, meta$Beds), toGRanges, format="narrowPeak")
 names(peakList) <- meta$Samp
 
-# Sort the cons peaks
+# Sort the peaks
 for (i in 1:length(peakList)){
   
   # seqlevelsStyle(peakList[[i]]) <- "NCBI"
