@@ -1,0 +1,127 @@
+---
+title: "CHIP-seq Peak Import, Annotate, and Evaluate"
+output: html_notebook
+---
+
+## Get metadata for samples
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+
+dir_bed <- "../data/interim/bed/idr"
+
+# Macs2 beds
+macs_beds <- list.files(path = dir_bed, pattern = ".narrowPeak", recursive = T)
+
+# Meta sheet
+meta <- data.frame(Beds = macs_beds,
+                   Samp = gsub("(.+)\\/.+\\/.+", "\\1", macs_beds))
+
+meta$Samp <- factor(meta$Samp, levels = unique(meta$Samp))
+
+print("Meta data acquired...")
+```
+
+
+# Import the peaks into a merged list object and plot for number of peaks at each timepoint
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+library(ChIPpeakAnno)
+
+# Import the cons peaks
+peakList <- sapply(file.path(dir_bed, meta$Beds), toGRanges, format="narrowPeak")
+names(peakList) <- meta$Samp
+
+# Sort the cons peaks
+for (i in 1:length(peakList)){
+  
+  # seqlevelsStyle(peakList[[i]]) <- "NCBI"
+  peakList[i] <- sortSeqlevels(peakList[[i]])
+  peakList[i] <- GenomicRanges::sort(peakList[[i]])
+}
+
+print("Peak data acquired...")
+```
+
+
+# Get Ensembl annotation database
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(AnnotationHub)
+library(ensembldb)
+
+ah <- AnnotationHub()
+
+## Query for all available EnsDb databases
+ahdb <- query(ah, pattern = c("EnsDb", "Mus musculus", 102))
+
+ensDb <- ahdb[[1]]
+
+# supportedFilters(ensDb)
+
+```
+
+
+## Annotate peaks with ensembl db
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(ChIPseeker)
+library(org.Mm.eg.db)
+library(GenomicFeatures)
+
+
+peakAnnoList_ens <- list()
+
+for (i in 1:length(peakList)){
+  
+  peak_tmp <- peakList[[i]]
+  seqlevelsStyle(peak_tmp) <- "NCBI"
+  
+  peakAnnoList_ens[[i]] <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, annoDb="org.Mm.eg.db", addFlankGeneInfo = T,
+                         overlap = "all")
+
+}
+
+names(peakAnnoList_ens) <- levels(meta$Samp)
+
+```
+
+
+# Evaluate location of peaks relative to annotation features
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+
+##########
+# Generate plot for peak number
+df <- lapply(peakList, length) %>% as.data.frame() %>% gather("Sample", "Peaks")
+df$Sample <- gsub("X", "", df$Sample)
+df$Sample <- factor(df$Sample, levels = df$Sample)
+
+b <- ggplot(df, aes(Sample, Peaks))+
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 0.8, vjust = 0.8)) +
+  labs(title = "Replicated Peaks (IDR < 5%)") + xlab(NULL)
+
+cowplot::ggsave2(plot = b, filename = "../data/processed/Peak_number,IDR.pdf", height = 4, width = 3)
+
+
+##########
+# Plot annotation bargraph
+p <- plotAnnoBar(peakAnnoList_ens, title = "H3K18la peak annotation")
+print(p)
+
+pdf("../data/processed/01_Peak_annot_bar.pdf",
+    height = 3, width = 5, useDingbats = F)
+print(p)
+dev.off()
+
+
+##########
+# Plot disrtobution of peaks realtive to TSS
+p <- plotDistToTSS(peakAnnoList_ens,
+              title="Distribution of H3K18la peak to TSS")
+print(p)
+
+pdf("../data/processed/01_Peak_TSSdist_bar.pdf",
+    height = 3, width = 5, useDingbats = F)
+print(p)
+dev.off()
+
+
+```
