@@ -1,0 +1,342 @@
+---
+title: "Quantitation of sliding windows and DB analysis"
+output: html_notebook
+
+---
+
+### CODE SUMMARY
+This code uses a sliding window to quatitate bam file reads. 
+Peak quantitation is performed via CSAW.
+The normalization is performed using 10k window counts via CSAW.
+Differential binding is performed using edgeR.
+
+
+#### Get list of bam files
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(tidyverse)
+
+# Macs2 beds
+bam_dir <- "../data/raw/bams/"
+macs_bams <- list.files(path = bam_dir, pattern = ".bam$")
+
+bed_dir <- "../data/interim/bed/"
+macs_beds <- list.files(path = bed_dir, pattern = ".narrowPeak.gz$")
+
+# Meta sheet
+meta <- read.csv("../src/data/meta.csv", stringsAsFactors = F)
+meta$bams <- macs_bams
+meta$beds <- macs_beds
+
+# Meta used
+meta_used <- meta %>% 
+    dplyr::filter(batch == 2, !(sample_name %in% c("456-20-7ft", "615-18A")), !(stage == 'normal'))
+
+meta_used <- meta_used %>% 
+    arrange(desc(stage), treatment)
+
+
+```
+
+
+#### Count reads into sliding widows
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(csaw)
+
+# Get list of bam files to be used for counting
+bam.files <- paste0(bam_dir, meta_used$bams)
+
+# Parameter settings
+frag.len <- 185 # determined by cross-correlation in the code down below
+win.width <- 150 # recommended by manual for histone marks
+wind.param <- readParam(pe="none", minq = 20, dedup = F)
+
+# Count the reads into sliding windows
+wind.counts <- windowCounts(bam.files, width=win.width, ext=frag.len, param=wind.param)
+
+colnames(wind.counts) <- meta_used$sample_name
+
+# Determine optimal fragment length using cross-correlation
+max.delay <- 500
+x <- correlateReads(bam.files, max.delay, param=wind.param)
+plot(0:max.delay, x, type="l", ylab="CCF", xlab="Delay (bp)")
+print(paste0("Optimal fragment size (bp): ", maximizeCcf(x)))
+
+print("Read counting complete...")
+```
+
+
+#### Filtering out the uninteresteing windows 
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(edgeR)
+# Use the count size filtering at 5 reads in average mean library size
+
+# Calculate abundances
+abundances <- aveLogCPM(asDGEList(wind.counts))
+
+# Keep windows greater than filter setting
+keep <- abundances > aveLogCPM(5, lib.size=mean(wind.counts$totals))
+print("Windows kept: ")
+summary(keep)
+
+filtered.data <- wind.counts[keep,]
+
+# Export filtered windows as bed file
+filt.wind <- filtered.data@rowRanges
+export.bed(filt.wind, con = "../data/processed/filtered_windows_rb.bed")
+
+```
+
+
+#### Normalization
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+
+# Using 10kb binned for actual normalization
+binned <- windowCounts(bam.files, bin=TRUE, width=10000, param=wind.param)
+print("10kb bin size: ")
+filtered.data <- normFactors(binned, se.out=filtered.data)
+
+# Visualize
+
+par(mfrow=c(1, 2), mar=c(5, 4, 2, 1.5))
+adj.counts <- cpm(asDGEList(binned), log=TRUE)
+normfacs <- filtered.data$norm.factors
+for (i in seq_len(length(bam.files)-1)) {
+cur.x <- adj.counts[,1]
+cur.y <- adj.counts[,1+i]
+smoothScatter(x=(cur.x+cur.y)/2+6*log2(10), y=cur.x-cur.y,
+xlab="A", ylab="M", main=paste("1 vs", i+1))
+all.dist <- diff(log2(normfacs[c(i+1, 1)]))
+abline(h=all.dist, col="red")
+}
+
+
+
+```
+
+
+#### PCA analysis
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(plot3D)
+library(PCAtools)
+library(wesanderson)
+
+wind.dge <- asDGEList(filtered.data,
+               group = paste(meta_used$stage, meta_used$treatment, sep = "_"))
+colnames(wind.dge) <- meta_used$sample_name
+
+wind.dge$logCPM <- log2(cpm(wind.dge) + 1)
+
+color.grp.pal <- wes_palette("Zissou1", 5, "discrete")[c(5,3)]
+color.grp.pal <- c(color.grp.pal, "plum")
+
+#
+#Prep the PCA data
+pca.wind <- PCAtools::pca(wind.dge$logCPM, metadata = data.frame(meta_used, row.names = colnames(wind.dge$logCPM)))
+pca.wind$metadata$Group <- factor(wind.dge$samples$group)
+
+sampkey <- color.grp.pal
+names(sampkey) <- unique(pca.wind$metadata$Group)[c(2:3,1)]
+
+
+#Plot rb samples
+rb.dge <- wind.dge[,grep("normal", wind.dge$samples$group, invert = T)]
+rb.dge$logCPM <- rb.dge$logCPM[,grep("normal", wind.dge$samples$group, invert = T)]
+pca.rb <- PCAtools::pca(rb.dge$logCPM, metadata = data.frame(Group = rb.dge$samples$group, row.names = row.names(rb.dge$samples)))
+
+X='PC1'; Y='PC2'
+pca3 <- biplot(pca.rb, x = X, y = Y,
+       colby = "Group", colkey = sampkey,
+       #lab = "replicate", labSize = 2,
+       legendPosition = 'right', 
+       title = 'Peak Quant PCA - Retinoblastoma Samples',
+       subtitle = paste0(X, ' versus ', Y))
+
+X='PC2'; Y='PC3'
+pca4 <- biplot(pca.rb, x = X, y = Y,
+       colby = "Group", colkey = sampkey,
+       #lab = "replicate", labSize = 2,
+       legendPosition = 'right', 
+       title = 'Peak Quant PCA - Retinoblastoma Samples',
+       subtitle = paste0(X, ' versus ', Y))
+
+print(pca3)
+print(pca4)
+
+cowplot::ggsave2(filename = "../data/processed/PCA_peak-rb_PC1-2.pdf", plot = pca3,
+                 width = 8, height = 6)
+cowplot::ggsave2(filename = "../data/processed/PCA_peak-rb_PC2-3.pdf", plot = pca4,
+                 width = 8, height = 6)
+
+```
+
+
+#### DE Analysis - CSAW manual
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(edgeR)
+library(rtracklayer)
+
+y <- asDGEList(filtered.data)
+y <- y[,which(meta_used$stage == "blastoma")]
+colnames(y) <- meta_used$sample_name[which(meta_used$stage == "blastoma")]
+
+stage_treat <- factor(paste(meta_used$stage[which(meta_used$stage == "blastoma")],
+                     meta_used$treatment[which(meta_used$stage == "blastoma")], sep = "_"))
+stage_treat[8] <- "blastoma_N"
+
+design <- model.matrix(~stage_treat)
+colnames(design) <- c("intercept", "stage_treat")
+
+y <- estimateDisp(y, design)
+summary(y$trended.dispersion)
+
+fit <- glmQLFit(y, design, robust=TRUE)
+summary(fit$var.post)
+
+par(mfrow=c(1,2))
+o <- order(y$AveLogCPM)
+plot(y$AveLogCPM[o], sqrt(y$trended.dispersion[o]), type="l", lwd=2,
+ylim=c(0, 1), xlab=expression("Ave."~Log[2]~"CPM"),
+ylab=("Biological coefficient of variation"))
+plotQLDisp(fit)
+
+summary(fit$df.prior)
+
+results <- glmQLFTest(fit, contrast=c(0, 1))
+head(results$table)
+
+
+```
+
+
+#### Merge windows and calculate p=value
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+
+# Merge windows
+merged <- mergeWindows(filtered.data, tol=200L)
+summary(width(merged$regions))
+length(merged$regions)
+export.bed(merged$regions, con = "../data/processed/merged_windows_rb.bed")
+
+
+# Get FDR and filter for DE significance
+tabcom <- combineTests(merged$ids, results$table)
+tabcom <- cbind(data.frame(merged$regions), tabcom)
+is.sig.region <- tabcom$FDR <= 0.05
+summary(is.sig.region)
+tabcom.sig <- tabcom[is.sig.region,]
+
+```
+
+
+#### Annotate merged windows
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(xlsx)
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+promoter <- getPromoters(TxDb=txdb, upstream=1000, downstream=500)
+
+
+merged.windAnno <- annotatePeak(merged$regions, tssRegion=c(-1000, 500),
+                     TxDb=txdb, annoDb="org.Hs.eg.db")
+
+merged.windAnno.sig <- annotatePeak(merged$regions[is.sig.region], tssRegion=c(-1000, 500),
+                     TxDb=txdb, annoDb="org.Hs.eg.db")
+# merged.windAnno.sig <- subset(merged.windAnno, subset = is.sig.region)
+
+export.bed(object = merged.windAnno.sig@anno, con = "../data/processed/merged_windows_sigDB_rb.bed")
+
+# Export DB results table
+merged_sigDB_output <- cbind(tabcom.sig, as.data.frame(merged.windAnno.sig@anno)[,c(6,12:17)])
+
+write.xlsx(x = merged_sigDB_output, file = "../data/processed/DB_output_results.xlsx", sheetName = "Sig_regions", row.names = F)
+
+```
+
+#### QC for merged windows
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+# Plot annotation bargraph
+p <- plotAnnoBar(merged.windAnno)
+print(p)
+
+pdf("../data/processed/01_Peak_annot_bar_mergedRb.pdf",
+    height = 4, width = 6, useDingbats = F)
+print(p)
+dev.off()
+
+
+# Plot annotation pie graph
+plotAnnoPie(merged.windAnno)
+
+pdf("../data/processed/01_Peak_annot_pie_mergedRb.pdf",
+    height = 4, width = 6, useDingbats = F)
+plotAnnoPie(merged.windAnno)
+dev.off()
+
+# Plot disrtobution of peaks realtive to TSS
+p <- plotDistToTSS(merged.windAnno,
+              title="Distribution of H3K27Ac-binding windows\nrelative to TSS")
+print(p)
+
+pdf("../data/processed/01_Peak_TSSdist_bar_mergedRb.pdf",
+    height = 4, width = 6, useDingbats = F)
+print(p)
+dev.off()
+
+
+p <- upsetplot(merged.windAnno)
+p <- p +
+    labs(title = "H3K27ac clustered peaks annotation")
+
+pdf("../data/processed/01_Peak_upsetplot_mergedRb.pdf",
+    height = 4, width = 6, useDingbats = F)
+print(p)
+dev.off()
+
+
+
+#----------------------------
+# QC DE Regions
+
+# Plot annotation bargraph
+p <- plotAnnoBar(merged.windAnno.sig) 
+print(p)
+
+pdf("../data/processed/01_Peak_annot_bar_mergedRb_sig.pdf",
+    height = 4, width = 6, useDingbats = F)
+print(p)
+dev.off()
+
+
+# Plot disrtobution of peaks realtive to TSS
+p <- plotDistToTSS(merged.windAnno.sig,
+              title="Distribution of DB H3K27Ac-binding windows\nrelative to TSS in Rb samples")
+print(p)
+
+pdf("../data/processed/01_Peak_TSSdist_bar_mergedRb_sig.pdf",
+    height = 4, width = 6, useDingbats = F)
+print(p)
+dev.off()
+
+# Plot annotation pie graph
+plotAnnoPie(merged.windAnno.sig)
+
+pdf("../data/processed/01_Peak_annot_pie_mergedRb_sig.pdf",
+    height = 4, width = 6, useDingbats = F)
+plotAnnoPie(merged.windAnno.sig)
+dev.off()
+
+p <- upsetplot(merged.windAnno.sig)
+p <- p +
+    labs(title = "H3K27ac significant DB clustered peaks annotation")
+
+pdf("../data/processed/01_Peak_upsetplot_mergedRb_sig.pdf",
+    height = 4, width = 6, useDingbats = F)
+print(p)
+dev.off()
+
+```
+
+

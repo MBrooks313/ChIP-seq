@@ -1,0 +1,239 @@
+---
+title: "Quantitation of defined peaks and DB analysis"
+output: html_notebook
+
+---
+
+### CODE SUMMARY
+This code uses a defined regions to quatitate bam file reads. 
+The defined region is determined by the reduction of the consensus peaks.
+Peak quantitation is performed via CSAW.
+The normalization is performed using 10k window counts via CSAW.
+Differential binding is performed using edgeR.
+
+
+#### Get bam, consensus bed, and meta files
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(tidyverse)
+
+# Macs2 beds
+bam_dir <- "../data/raw/bams/"
+macs_bams <- list.files(path = bam_dir, pattern = ".bam$")
+
+bed_dir <- "../data/interim/bed/"
+macs_beds <- list.files(path = bed_dir, pattern = ".narrowPeak.gz$")
+
+# Meta sheet
+meta <- read.csv("../src/data/meta.csv", stringsAsFactors = F)
+meta$bams <- macs_bams
+meta$beds <- macs_beds
+meta$stage[which(meta$sample_name == "1186-15B")] <- "MYCN_amp"
+
+# Meta used
+meta_used <- meta %>% 
+    dplyr::filter(batch == 2, !(sample_name %in% c("456-20-7ft", "615-18A")))
+
+meta_used <- meta_used %>% 
+    arrange(desc(stage), treatment)
+
+
+```
+
+
+# Get Ensembl annotation database
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(AnnotationHub)
+library(ensembldb)
+
+ah <- AnnotationHub()
+
+## Query for all available EnsDb databases
+ahdb <- query(ah, pattern = c("EnsDb", "Homo sapiens", 102))
+
+ensDb <- ahdb[[1]]
+
+# supportedFilters(ensDb)
+
+```
+
+
+#### Prep defined regions for DE
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(GenomicRanges)
+library(ChIPseeker)
+library(ChIPpeakAnno)
+library(rtracklayer)
+
+# Import peaks to a list
+peaksList <- sapply(paste0(bed_dir, meta_used$beds), toGRanges, format="narrowPeak")
+names(peaksList) <- meta_used$sample_name
+peaksList_gr <- GRangesList(peaksList)
+
+# Reduce the features
+peak_features <- GenomicRanges::reduce(unlist(peaksList_gr))
+seqlevelsStyle(peak_features) <- "UCSC"
+export.bed(peak_features, con = "../data/interim/bed/peak_features.bed")
+ 
+# Annotate the features
+peak_features_anno <- annotatePeak(peak_features, tssRegion=c(-1000, 500),
+                         TxDb=txdb, addFlankGeneInfo = T,
+                         overlap = "all")
+peak_features_anno@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = peak_features_anno@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+
+```
+
+
+#### Count reads into widows
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(csaw)
+
+# Get bam file list to quantitate
+peak.bam <- paste0(bam_dir, meta_used$bams)
+
+# Set up parameters for quantitation
+peak.param <- readParam(max.frag=400, pe="none", minq = 20, dedup = T)
+
+# Quantitate defined regions
+peak.counts <- regionCounts(peak.bam, peak_features_anno@anno, ext=250, param=peak.param)
+colnames(peak.counts) <- meta_used$sample_name
+
+
+```
+
+
+#### Normalization
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+
+binned <- windowCounts(peak.bam, bin=TRUE, width=10000, param=peak.param)
+filtered.data <- normFactors(binned, se.out=T)
+filtered.data$norm.factors
+
+```
+
+
+#### PCA analysis
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(plot3D)
+library(PCAtools)
+library(wesanderson)
+
+peak.dge <- asDGEList(peak.counts,
+               norm.factors = filtered.data$norm.factors,
+               group = paste(meta_used$stage, meta_used$treatment, sep = "_"),
+               genes = as.data.frame(peak_features_anno))
+colnames(peak.dge) <- colnames(peak.counts)
+
+peak.dge$logCPM <- log2(cpm(peak.dge) + 1)
+
+color.grp.pal <- wes_palette("Zissou1", 5, "discrete")[c(1,2,5,3)]
+color.grp.pal <- c(color.grp.pal, "plum")
+
+#
+#Prep the PCA data
+pca.peak <- PCAtools::pca(peak.dge$logCPM, metadata = data.frame(meta_used, row.names = colnames(peak.dge$logCPM)))
+pca.peak$metadata$Group <- factor(peak.dge$samples$group)
+
+sampkey <- color.grp.pal
+names(sampkey) <- unique(pca.peak$metadata$Group)[c(1:2,4:5,3)]
+
+#Plot the eigencorplot
+ep <- eigencorplot(pca.peak, metavars = names(pca.peak$metadata),
+             main = "Correlation of PCs to Meta Features")
+
+#Plot the pairsplot
+pp <- pairsplot(pca.peak, colby = "Group", colkey = sampkey, components = seq_len((5)))
+
+
+#Plot all the samples
+X='PC1'; Y='PC2'
+pca1 <- biplot(pca.peak, x = X, y = Y,
+       colby = "Group", colkey = sampkey,
+       #lab = "replicate", labSize = 2,
+       legendPosition = 'right', 
+       title = 'Peak Quant PCA - All Samples',
+       subtitle = paste0(X, ' versus ', Y))
+
+#Plot all the samples
+X='PC2'; Y='PC3'
+pca2 <- biplot(pca.peak, x = X, y = Y,
+       colby = "Group", colkey = sampkey,
+       #lab = F, labSize = 2,
+       legendPosition = 'right', 
+       title = 'Peak Quant PCA - All Samples',
+       subtitle = paste0(X, ' versus ', Y))
+
+print(pca1)
+print(pca2)
+
+cowplot::ggsave2(filename = "../data/processed/PCA_peak-all_PC1-2.pdf", plot = pca1,
+                 width = 8, height = 6)
+cowplot::ggsave2(filename = "../data/processed/PCA_peak-all_PC2-3.pdf", plot = pca2,
+                 width = 8, height = 6)
+
+
+
+```
+
+
+#### DE Analysis
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(edgeR)
+
+samps_rb <- which(meta_used$stage == "blastoma")
+
+# Group information
+grp_rb <- factor(paste(meta_used$stage, meta_used$treatment, sep = "_")[samps_rb])
+
+# Design
+design <- model.matrix(~grp_rb)
+colnames(design) <- gsub(".+_(P.+)", "\\1", colnames(design))
+
+rb.dge <- estimateDisp(rb.dge, design)
+summary(rb.dge$trended.dispersion)
+
+fit <- glmQLFit(rb.dge, design, robust=TRUE)
+summary(fit$var.post)
+
+o <- order(rb.dge$AveLogCPM)
+plot(rb.dge$AveLogCPM[o], sqrt(rb.dge$trended.dispersion[o]), type="l", lwd=2,
+ylim=c(0, 1), xlab=expression("Ave."~Log[2]~"CPM"),
+ylab=("Biological coefficient of variation"))
+plotQLDisp(fit)
+
+
+
+```
+
+
+#### DE Analysis - CSAW manual
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(edgeR)
+
+y <- asDGEList(filtered.data)
+y <- y[,which(meta_used$stage == "blastoma")]
+colnames(y) <- meta_used$sample_name[which(meta_used$stage == "blastoma")]
+
+stage_treat <- factor(paste(meta_used$stage[which(meta_used$stage == "blastoma")],
+                     meta_used$treatment[which(meta_used$stage == "blastoma")], sep = "_"))
+
+design <- model.matrix(~stage_treat)
+colnames(design) <- c("intercept", "stage_treat")
+
+y <- estimateDisp(y, design)
+summary(y$trended.dispersion)
+
+fit <- glmQLFit(y, design, robust=TRUE)
+summary(fit$var.post)
+
+par(mfrow=c(1,2))
+o <- order(y$AveLogCPM)
+plot(y$AveLogCPM[o], sqrt(y$trended.dispersion[o]), type="l", lwd=2,
+ylim=c(0, 1), xlab=expression("Ave."~Log[2]~"CPM"),
+ylab=("Biological coefficient of variation"))
+plotQLDisp(fit)
+
+
+```
