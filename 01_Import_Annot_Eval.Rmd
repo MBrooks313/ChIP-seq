@@ -4,38 +4,42 @@ output: html_notebook
 ---
 
 ## Get metadata for samples
-```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+```{r, echo = TRUE, results = 'asis', warning=FALSE, message=FALSE}
 
-dir_bed <- "../data/interim/bed/idr"
+dir_bed <- "../data/interim/bed/macs2/"
 
 # Macs2 beds
 macs_beds <- list.files(path = dir_bed, pattern = ".narrowPeak", recursive = T)
 
 # Meta sheet
 meta <- data.frame(Beds = macs_beds,
-                   Samp = gsub("(.+)\\/.+\\/.+", "\\1", macs_beds))
-
-meta$Samp <- factor(meta$Samp, levels = unique(meta$Samp))
+                   Treat = gsub("(.+)_.+_R.+", "\\1", macs_beds),
+                   Mark = gsub(".+_(.+)_R.+", "\\1", macs_beds),
+                   Rep = gsub(".+_(R\\d).+", "\\1", macs_beds))
 
 print("Meta data acquired...")
 ```
 
 
 # Import the peaks into a merged list object
-```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+```{r, echo = TRUE, results = 'asis', warning=FALSE, message=FALSE}
 library(ChIPpeakAnno)
 
 # Import the peaks
 peakList <- sapply(file.path(dir_bed, meta$Beds), toGRanges, format="narrowPeak")
-names(peakList) <- meta$Samp
+names(peakList) <- paste(meta$Treat, meta$Mark, meta$Rep, sep = "_")
 
+peakList_filt <- list()
 # Sort the peaks
 for (i in 1:length(peakList)){
   
   # seqlevelsStyle(peakList[[i]]) <- "NCBI"
-  peakList[i] <- sortSeqlevels(peakList[[i]])
-  peakList[i] <- GenomicRanges::sort(peakList[[i]])
+  tmp_peak <- sortSeqlevels(peakList[[i]])
+  tmp_peak <- GenomicRanges::sort(peakList[[i]])
+  tmp_peak <- tmp_peak[(elementMetadata(tmp_peak)[,"qValue"] > 6) & (seqnames(tmp_peak) != "MT")]
+  peakList_filt[[i]] <- tmp_peak
 }
+names(peakList_filt) <- names(peakList)
 
 print("Peak data acquired...")
 ```
@@ -49,7 +53,7 @@ library(ensembldb)
 ah <- AnnotationHub()
 
 ## Query for all available EnsDb databases
-ahdb <- query(ah, pattern = c("EnsDb", "Mus musculus", 102))
+ahdb <- query(ah, pattern = c("EnsDb", "Homo sapiens", 113))
 
 ensDb <- ahdb[[1]]
 
@@ -61,34 +65,39 @@ ensDb <- ahdb[[1]]
 ## Annotate peaks with ensembl db
 ```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
 library(ChIPseeker)
-library(org.Mm.eg.db)
+# library(org.Mm.eg.db)
 library(GenomicFeatures)
 
 
 peakAnnoList_ens <- list()
 
-for (i in 1:length(peakList)){
+for (i in 1:length(peakList_filt)){
   
-  peak_tmp <- peakList[[i]]
+  peak_tmp <- peakList_filt[[i]]
   seqlevelsStyle(peak_tmp) <- "NCBI"
   
-  peakAnnoList_ens[[i]] <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
-                         TxDb=ensDb, annoDb="org.Mm.eg.db", addFlankGeneInfo = T,
+  anno_tmp <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
                          overlap = "all")
-
+  anno_tmp@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = anno_tmp@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+  peakAnnoList_ens[[i]] <- anno_tmp
 }
 
-names(peakAnnoList_ens) <- levels(meta$Samp)
+names(peakAnnoList_ens) <- names(peakList_filt)
 
 ```
 
 
 # Evaluate location of peaks relative to annotation features
 ```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+library(tidyverse)
 
 ##########
 # Generate plot for peak number
-df <- lapply(peakList, length) %>% as.data.frame() %>% gather("Sample", "Peaks")
+df <- lapply(peakList_filt, length) %>% as.data.frame() %>% gather("Sample", "Peaks")
 df$Sample <- gsub("X", "", df$Sample)
 df$Sample <- factor(df$Sample, levels = df$Sample)
 
@@ -96,14 +105,14 @@ b <- ggplot(df, aes(Sample, Peaks))+
   geom_bar(stat = "identity") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 30, hjust = 0.8, vjust = 0.8)) +
-  labs(title = "Replicated Peaks (IDR < 5%)") + xlab(NULL)
+  labs(title = "Peak Number") + xlab(NULL)
 
-cowplot::ggsave2(plot = b, filename = "../data/processed/Peak_number,IDR.pdf", height = 4, width = 3)
+cowplot::ggsave2(plot = b, filename = "../data/processed/01_Peak_number_1E6.pdf", height = 4, width = 3)
 
 
 ##########
 # Plot annotation bargraph
-p <- plotAnnoBar(peakAnnoList_ens, title = "H3K18la peak annotation")
+p <- plotAnnoBar(peakAnnoList_ens, title = "Peak annotation")
 print(p)
 
 pdf("../data/processed/01_Peak_annot_bar.pdf",
@@ -115,7 +124,7 @@ dev.off()
 ##########
 # Plot disrtobution of peaks realtive to TSS
 p <- plotDistToTSS(peakAnnoList_ens,
-              title="Distribution of H3K18la peak to TSS")
+              title="Distribution of peaks to TSS")
 print(p)
 
 pdf("../data/processed/01_Peak_TSSdist_bar.pdf",
@@ -123,5 +132,44 @@ pdf("../data/processed/01_Peak_TSSdist_bar.pdf",
 print(p)
 dev.off()
 
+
+```
+
+
+# Export bed files
+```{r}
+library(rtracklayer)
+
+bed_out_dir <- "../data/interim/bed/01_annotated_peaks/"
+dir.create(bed_out_dir, showWarnings = T)
+
+
+# Filtered, annotated peaks
+
+for (i in names(peakAnnoList_ens)){
+  tmp_bed <- peakAnnoList_ens[[i]]@anno
+  export.bed(tmp_bed, con = paste0(bed_out_dir, i, "_anno.bed"))
+}
+
+
+
+```
+
+
+# Export objects
+```{r}
+
+saveRDS(peakList, file = "../data/interim/01_peakList.RDS")
+saveRDS(peakList_filt, file = "../data/interim/01_peakList_1E6.RDS")
+saveRDS(peakAnnoList_ens, file = "../data/interim/01_peakAnnoList_ens.RDS")
+
+
+```
+
+
+# Export software versions
+```{r}
+
+sessionInfo()
 
 ```
